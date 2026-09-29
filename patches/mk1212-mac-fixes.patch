@@ -1,0 +1,1059 @@
+diff --git a/scripts/build-runtime-patch b/scripts/build-runtime-patch
+new file mode 100755
+index 0000000..fc39dbf
+--- /dev/null
++++ b/scripts/build-runtime-patch
+@@ -0,0 +1,25 @@
++#!/bin/zsh
++set -euo pipefail
++
++repo_root="${0:A:h:h}"
++output="${1:-$repo_root/build/libmk1212-slot-runtime-patch.dylib}"
++source_file="${2:-$repo_root/src/mk1212_slot_runtime_patch.c}"
++signing_identity="${CODESIGN_IDENTITY:--}"
++
++mkdir -p "${output:h}"
++/usr/bin/xcrun clang \
++    -arch arm64 \
++    -dynamiclib \
++    -mmacosx-version-min=12.0 \
++    -Wl,-install_name,@rpath/libmk1212-slot-runtime-patch.dylib \
++    -Wall -Wextra -Werror \
++    "$source_file" \
++    -o "$output"
++
++sign_args=(--force --sign "$signing_identity")
++if [[ "$signing_identity" != "-" ]]; then
++    sign_args+=(--options runtime --timestamp)
++fi
++/usr/bin/codesign "${sign_args[@]}" "$output"
++/usr/bin/codesign --verify --strict "$output"
++print "$output"
+diff --git a/src/mk1212_mac_tool.py b/src/mk1212_mac_tool.py
+index fd384d8..2e952a6 100755
+--- a/src/mk1212_mac_tool.py
++++ b/src/mk1212_mac_tool.py
+@@ -33,6 +33,26 @@ from typing import BinaryIO, Iterable
+ APP_ID = "325610"
+ TOOL_VERSION = "0.6.1-safe-launcher"
+ PROFILE_COMPATIBILITY_REVISION = "mac-slot-safe-noop-v1"
++SUPPORTED_RUNTIME_EXECUTABLE_SHA256 = (
++    "13f5d523019f291f489353fa5d3661bc9a668bb2b0375d6c3201e01d74525c5e"
++)
++# Statuses the injected library logs when it refuses or fails to patch.
++TEN_SLOT_PATCH_FAILURES = (
++    "no-main-executable",
++    "unsupported-uuid",
++    "preimage-mismatch",
++    "make-writable-failed",
++    "restore-execute-failed",
++    "postimage-mismatch",
++)
++# SHA-256 of the signed inject-only diagnostic library, built from
++# src/mk1212_slot_runtime_patch_inject_only.c into
++# build/libmk1212-slot-runtime-patch.dylib.  It runs the patch's guards but
++# never changes memory protection or writes, and it is the only library whose
++# inject-only status the launcher accepts.
++INJECT_ONLY_RUNTIME_PATCH_SHA256 = (
++    "e677f43b681902cc5ef51936e9a73f5dd59879ef49e3b68fa1b37c8e6af9a0dd"
++)
+ DEFAULT_STATE = Path.home() / "Library/Application Support/MK1212 Mac Launcher"
+ FERAL_STATE = Path.home() / "Library/Application Support/Feral Interactive/Total War ATTILA"
+ GENERATED_PREFIX = "zzz_mk1212shim_"
+@@ -844,7 +864,7 @@ def plan_compatibility(game_root: Path, packs: list[Path]) -> tuple[list[dict],
+                     repaired_info = parse_dds(transformed)
+                     repairs.append({"entry": entry, "data": transformed, "reason": reason,
+                                     "source": vars(source_info), "target": vars(repaired_info)})
+-        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", pack.stem)[:64]
++        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", pack.stem).lower()[:64]
+         content_name = f"{GENERATED_PREFIX}{order:03d}_content_{safe}_movie.pack"
+         overlay_name = f"{GENERATED_PREFIX}{order:03d}_repair_{safe}_movie.pack" if repairs else None
+         plan.append({"order": order, "source": pack, "metadata": metadata, "entries": entries,
+@@ -911,7 +931,7 @@ def load_state(state_dir: Path) -> dict:
+ 
+ 
+ def game_running() -> bool:
+-    result = subprocess.run(["/usr/bin/pgrep", "-f", "Total War ATTILA.app/Contents/MacOS/Total War ATTILA"],
++    result = subprocess.run(["/usr/bin/pgrep", "-f", "Total War ATTILA( MK1212)?.app/Contents/MacOS/Total War ATTILA"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+     return result.returncode == 0
+ 
+@@ -954,6 +974,8 @@ def prepare_isolated_home(state_dir: Path) -> Path:
+         link, target = isolated_vfs / name, real_vfs / name
+         if link.is_symlink() and link.resolve() == target.resolve():
+             continue
++        if name == "Local" and link.is_dir() and not link.is_symlink():
++            continue
+         if link.exists() or link.is_symlink():
+             raise ToolError(f"unexpected isolated VFS path: {link}")
+         link.symlink_to(target, target_is_directory=True)
+@@ -1055,6 +1077,103 @@ def profile_key(records: list[dict], compatibility_revision: str = PROFILE_COMPA
+     return sha256_bytes(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode())[:20]
+ 
+ 
++def lua_short_string_line_break(text: str) -> int | None:
++    """Return the line of the first unescaped line break inside a quoted string.
++
++    Lua 5.1 rejects a raw line break inside '...' or "..." ("unfinished
++    string"); luaparser accepts it, so this rule is checked separately.
++    Comments and long brackets ([[...]], [==[...]==]) may span lines.
++    """
++    index, length = 0, len(text)
++    while index < length:
++        char = text[index]
++        if text.startswith("--", index):
++            index += 2
++            match = re.match(r"\[(=*)\[", text[index:])
++            if match:
++                close = "]" + match.group(1) + "]"
++                end = text.find(close, index + match.end())
++                index = length if end < 0 else end + len(close)
++            else:
++                end = text.find("\n", index)
++                index = length if end < 0 else end
++            continue
++        if char == "[":
++            match = re.match(r"\[(=*)\[", text[index:])
++            if match:
++                close = "]" + match.group(1) + "]"
++                end = text.find(close, index + match.end())
++                index = length if end < 0 else end + len(close)
++                continue
++        if char in "\"'":
++            start = index
++            index += 1
++            while index < length and text[index] != char:
++                if text[index] == "\\":
++                    index += 2            # an escaped character, including \<newline>
++                    continue
++                if text[index] in "\r\n":
++                    return text.count("\n", 0, start) + 1
++                index += 1
++            index += 1
++            continue
++        index += 1
++    return None
++
++
++_LUA51_COMPILE = None
++
++
++def lua51_compile_error(data: bytes, chunk_name: str) -> str | None:
++    """Compile (never run) a chunk with a real Lua 5.1, the game's own version.
++
++    Returns None if it compiles, otherwise Lua's error message.
++    """
++    global _LUA51_COMPILE
++    if _LUA51_COMPILE is None:
++        try:
++            from lupa import lua51
++        except ImportError as error:
++            raise ToolError(
++                "Lua 5.1 compile checking needs lupa: /usr/bin/python3 -m pip install --user lupa"
++            ) from error
++        runtime = lua51.LuaRuntime()
++        if runtime.eval("_VERSION") != "Lua 5.1":
++            raise ToolError("lupa.lua51 did not provide a Lua 5.1 runtime; refusing to validate with it")
++        _LUA51_COMPILE = runtime.eval(
++            "function(source, name) local chunk, err = loadstring(source, name) "
++            "if chunk then return true end return err end"
++        )
++    result = _LUA51_COMPILE(data, "=" + chunk_name)
++    return None if result is True else str(result)
++
++
++def validate_lua_syntax(relative_path: str, data: bytes) -> None:
++    """Refuse a repaired Lua file that the game's Lua 5.1 loader would reject."""
++    compile_error = lua51_compile_error(data, relative_path)
++    if compile_error is not None:
++        raise ToolError(f"repaired Lua {relative_path} does not compile under Lua 5.1: {compile_error}; "
++                        "refusing to install it")
++    try:
++        from luaparser import ast as lua_ast
++    except ImportError as error:
++        raise ToolError(
++            "Lua syntax checking needs luaparser: /usr/bin/python3 -m pip install --user luaparser"
++        ) from error
++    text = data.decode("latin-1")
++    broken_line = lua_short_string_line_break(text)
++    if broken_line is not None:
++        raise ToolError(
++            f"repaired Lua {relative_path} has a line break inside a quoted string at line {broken_line}; "
++            "refusing to install it"
++        )
++    try:
++        lua_ast.parse(text)
++    except Exception as error:
++        message = str(error).strip().splitlines()[0] if str(error).strip() else type(error).__name__
++        raise ToolError(f"repaired Lua {relative_path} does not parse: {message}; refusing to install it") from error
++
++
+ def apply_lua_compatibility(relative_path: str, data: bytes) -> tuple[bytes, list[str]]:
+     """Apply narrowly-scoped, reversible Feral UI compatibility edits.
+ 
+@@ -1064,46 +1183,448 @@ def apply_lua_compatibility(relative_path: str, data: bytes) -> tuple[bytes, lis
+     """
+     relative_folded = relative_path.casefold()
+     if relative_folded == "campaigns/main_attila/mk1212_slots.lua":
+-        function_old = b'''function ModifyHardcodedLimits()
+-\tDISCLAIMER_ACCEPTED = true;
+-
+-\t--if not util.fileExists("MK1212_10slots.exe") then
+-\t\trequire("lua_scripts/slots_binaries");
+-
+-\t\tlocal slotsFile = io.open("MK1212_10slots.exe", "wb");
+-\t\tlocal binary = "";
+-\t\t\t
+-\t\tfor i = 1, #slots_binaries do
+-\t\t\tlocal number = tonumber("0x"..slots_binaries[i]);
+-\t\t\tlocal char = string.char(number);
+-
+-\t\t\tbinary = binary..char;
+-\t\tend
+-
+-\t\tslotsFile:write(binary);
+-\t\tslotsFile:close();
+-\t--end
+-
+-\tlocal command = "MK1212_10slots.exe";
++        if sha256_bytes(data) != "6baa1d7dc93d0ad4fdf38308d91fb6cdd7fa9851ac44344809368ab9ec64cda5":
++            raise ToolError("unexpected MK1212 campaign slot script; refusing an unsafe replacement")
++        # The original file implements only the Windows executable prompt.
++        # mk1212_start.lua calls Add_MK1212_Slots_Listeners(), so retain that
++        # entry point. The separate native library supplies ten functional
++        # slots; this script only hides the obsolete layout-owned button.
++        return b'''-- MK1212 macOS: the native runtime patch supplies ten settlement slots.
++-- Keep the original listener entry point without constructing the Windows UI.
++function Add_MK1212_Slots_Listeners()
++    cm:add_listener("MK1212_Hide_Windows_Button_OnPanel", "PanelOpenedCampaign", true,
++        function(context) cm:add_time_trigger("MK1212_Hide_Windows_Button", 0.1) end, true);
++    cm:add_listener("MK1212_Hide_Windows_Button_OnSettlement", "SettlementSelected", true,
++        function(context) cm:add_time_trigger("MK1212_Hide_Windows_Button", 0.1) end, true);
++    cm:add_listener("MK1212_Hide_Windows_Button_OnTimer", "TimeTrigger",
++        function(context) return context.string == "MK1212_Hide_Windows_Button" end,
++        function(context)
++            local root = cm:ui_root();
++            local panel_found = root:Find("main_settlement_panel");
++            if panel_found then
++                local panel = UIComponent(panel_found);
++                if panel:Visible() then
++                    local button_found = panel:Find("button_disclaimer");
++                    if button_found then
++                        UIComponent(button_found):SetVisible(false);
++                    end
++                end
++            end
++        end, true);
++end
++''', ["removed the Windows-only slot dialog and click handler; hide its layout button on settlement events"]
++
++    if relative_folded == "campaigns/main_attila/mechanics/mechanics_buffer_states.lua":
++        # Temporary diagnostic: trace buffer-state release decisions to the mod's DebugLog.
++        selected_old = (
++            b'function OnSettlementSelected_Buffer(context)\n'
++            b'\tlocal root = cm:ui_root();\n'
++            b'\tlocal btnBuffer = UIComponent(root:Find("button_release_buffer_state"));\n'
++            b'\tlocal faction_name = FACTION_TURN;\n'
++            b'\tlocal region_name = context:garrison_residence():region():name();\n'
++            b'\tlocal region_owner_name = context:garrison_residence():region():owning_faction():name();\n'
++            b'\n'
++            b'\tif btnBuffer:Visible() == true then\n'
++            b'\t\tbtnBuffer:SetState("inactive"); \n'
++            b'\t\tbtnBuffer:SetVisible(false);\n'
++            b'\tend\n'
++            b'\n'
++            b'\tif region_owner_name == faction_name then\n'
++            b'\t\tlocal vassal_faction_name = REGIONS_LIBERATION_FACTIONS[region_name];\n'
++            b'\t\tlocal vassal_faction = cm:model():world():faction_by_key(vassal_faction_name);\n'
++            b'\n'
++            b'\t\tif not FactionIsAlive(vassal_faction_name) then\n'
++            b"\t\t\t-- Don't allow HRE factions to be released as buffer states unless Renovatio Imperii has already occured.\n"
++            b'\t\t\tif mkHRE and mkHRE.factions_start and mkHRE.current_reform then\n'
++            b'\t\t\t\tif HasValue(mkHRE.factions_start, vassal_faction_name) and mkHRE.current_reform < 9 then\n'
++            b'\t\t\t\t\treturn;\n'
++            b'\t\t\t\tend\n'
++            b'\t\t\tend\n'
++            b'\n'
++            b'\t\t\tif cm:get_local_faction() == FACTION_TURN then\n'
++            b'\t\t\t\tbtnBuffer:SetState("active"); \n'
++            b'\t\t\t\tbtnBuffer:SetVisible(true);\n'
++            b'\t\t\tend\n'
++            b'\t\tend\n'
++            b'\tend\n'
++            b'end'
++        )
++        selected_new = (
++            b'function OnSettlementSelected_Buffer(context)\n'
++            b'\tlocal root = cm:ui_root();\n'
++            b'\tlocal btnBuffer = UIComponent(root:Find("button_release_buffer_state"));\n'
++            b'\tlocal faction_name = FACTION_TURN;\n'
++            b'\tlocal region_name = context:garrison_residence():region():name();\n'
++            b'\tlocal region_owner_name = context:garrison_residence():region():owning_faction():name();\n'
++            b'\n'
++            b'\tDebugLog("BUFFER: selected region="..tostring(region_name).." owner="..tostring(region_owner_name).." turn_faction="..tostring(faction_name));\n'
++            b'\n'
++            b'\tif btnBuffer:Visible() == true then\n'
++            b'\t\tbtnBuffer:SetState("inactive"); \n'
++            b'\t\tbtnBuffer:SetVisible(false);\n'
++            b'\tend\n'
++            b'\n'
++            b'\tif region_owner_name == faction_name then\n'
++            b'\t\tlocal vassal_faction_name = REGIONS_LIBERATION_FACTIONS[region_name];\n'
++            b'\t\tlocal vassal_faction = cm:model():world():faction_by_key(vassal_faction_name);\n'
++            b'\n'
++            b'\t\tif vassal_faction_name == nil then\n'
++            b'\t\t\tDebugLog("BUFFER: no REGIONS_LIBERATION_FACTIONS entry for "..tostring(region_name));\n'
++            b'\t\tend\n'
++            b'\n'
++            b'\t\tif vassal_faction == nil then\n'
++            b'\t\t\tDebugLog("BUFFER: faction_by_key returned nil for "..tostring(vassal_faction_name));\n'
++            b'\t\tend\n'
++            b'\n'
++            b'\t\tDebugLog("BUFFER: owner matches; vassal="..tostring(vassal_faction_name).." FactionIsAlive="..tostring(FactionIsAlive(vassal_faction_name)));\n'
++            b'\n'
++            b'\t\tif not FactionIsAlive(vassal_faction_name) then\n'
++            b"\t\t\t-- Don't allow HRE factions to be released as buffer states unless Renovatio Imperii has already occured.\n"
++            b'\t\t\tif mkHRE and mkHRE.factions_start and mkHRE.current_reform then\n'
++            b'\t\t\t\tDebugLog("BUFFER: HRE gate checked; current_reform="..tostring(mkHRE.current_reform).." in_start_list="..tostring(HasValue(mkHRE.factions_start, vassal_faction_name)));\n'
++            b'\n'
++            b'\t\t\t\tif HasValue(mkHRE.factions_start, vassal_faction_name) and mkHRE.current_reform < 9 then\n'
++            b'\t\t\t\t\tDebugLog("BUFFER: HRE gate blocked "..tostring(vassal_faction_name).."; button not shown");\n'
++            b'\t\t\t\t\treturn;\n'
++            b'\t\t\t\tend\n'
++            b'\t\t\telse\n'
++            b'\t\t\t\tDebugLog("BUFFER: HRE gate skipped; mkHRE table unavailable");\n'
++            b'\t\t\tend\n'
++            b'\n'
++            b'\t\t\tDebugLog("BUFFER: HRE gate passed");\n'
++            b'\n'
++            b'\t\t\tif cm:get_local_faction() == FACTION_TURN then\n'
++            b'\t\t\t\tbtnBuffer:SetState("active"); \n'
++            b'\t\t\t\tbtnBuffer:SetVisible(true);\n'
++            b'\n'
++            b'\t\t\t\tDebugLog("BUFFER: button shown for "..tostring(region_name).." -> "..tostring(vassal_faction_name));\n'
++            b'\t\t\telse\n'
++            b'\t\t\t\tDebugLog("BUFFER: button not shown; local_faction="..tostring(cm:get_local_faction()).." turn_faction="..tostring(FACTION_TURN));\n'
++            b'\t\t\tend\n'
++            b'\t\telse\n'
++            b'\t\t\tDebugLog("BUFFER: button not shown; "..tostring(vassal_faction_name).." is alive");\n'
++            b'\t\tend\n'
++            b'\telse\n'
++            b'\t\tDebugLog("BUFFER: button not shown; region owner "..tostring(region_owner_name).." is not the turn faction");\n'
++            b'\tend\n'
++            b'end'
++        )
++        confirm_old = (
++            b'elseif context.string == "button_buffer_confirm" then\n'
++            b'\t\tlocal root = cm:ui_root();\n'
++            b'\t\tlocal btnBuffer = UIComponent(root:Find("button_release_buffer_state"));\n'
++            b'\t\tlocal faction_name = FACTION_TURN;\n'
++            b'\t\tlocal faction = cm:model():world():faction_by_key(faction_name);\n'
++            b'\t\tlocal vassal_faction_name = REGIONS_LIBERATION_FACTIONS[REGION_SELECTED];\n'
++            b'\t\tlocal vassal_faction = cm:model():world():faction_by_key(vassal_faction_name);\n'
++            b'\t\tlocal spear_unit = BUFFER_STATE_SPEAR_UNITS[vassal_faction_name];\n'
++            b'\t\tlocal unit_list = "";\n'
++            b'\n'
++            b'\t\tif spear_unit then\n'
++            b'\t\t\tunit_list = spear_unit..","..spear_unit..","..spear_unit..","..spear_unit;\n'
++            b'\t\telse\n'
++            b"\t\t\t-- We need to give them something even if it's inaccurate, otherwise the army will not spawn.\n"
++            b'\t\t\tunit_list = "att_rom_cohors";\n'
++            b'\t\tend\n'
++            b'\n'
++            b'\t\tif not FactionIsAlive(vassal_faction_name) then\n'
++            b'\t\t\tlocal region = cm:model():world():region_manager():region_by_key(REGION_SELECTED);\n'
++            b'\t\t\tlocal region_x = region:settlement():logical_position_x();\n'
++            b'\t\t\tlocal region_y = region:settlement():logical_position_y();\n'
++            b'\n'
++            b'\t\t\tcm:create_force(\n'
++            b'\t\t\t\tvassal_faction_name,\n'
++            b'\t\t\t\tunit_list,\n'
++            b'\t\t\t\tREGION_SELECTED,\n'
++            b'\t\t\t\tregion_x,\n'
++            b'\t\t\t\tregion_y,\n'
++            b'\t\t\t\t"VassalArmy_"..REGION_SELECTED..cm:model():turn_number(),\n'
++            b'\t\t\t\ttrue,\n'
++            b'\t\t\t\tfunction(cqi) \n'
++            b'\n'
++            b'\t\t\t\tend\n'
++            b'\t\t\t);\n'
++            b'\n'
++            b'\t\t\tcm:force_make_vassal(faction_name, vassal_faction_name);\n'
++            b'\t\t\tcm:add_time_trigger("region_transfer", 0.1);\n'
++            b'\n'
++            b'\t\t\tif FACTIONS_TO_FACTIONS_VASSALIZED  then\n'
++            b'\t\t\t\tFaction_Vassalized(faction_name, vassal_faction_name, true, false, false);\n'
++            b'\t\t\tend\n'
++            b'\t\telse\n'
++            b'\t\t\tTransfer_Region_To_Faction(REGION_SELECTED, vassal_faction_name);\n'
++            b'\t\tend\n'
++            b'\n'
++            b'\t\tBufferPanelClosed(false);\n'
++            b'\t\tbtnBuffer:SetVisible(false);'
++        )
++        confirm_new = (
++            b'elseif context.string == "button_buffer_confirm" then\n'
++            b'\t\tDebugLog("BUFFER: confirm clicked; REGION_SELECTED="..tostring(REGION_SELECTED).." FACTION_TURN="..tostring(FACTION_TURN));\n'
++            b'\t\tlocal root = cm:ui_root();\n'
++            b'\t\tlocal btnBuffer = UIComponent(root:Find("button_release_buffer_state"));\n'
++            b'\t\tlocal faction_name = FACTION_TURN;\n'
++            b'\t\tlocal faction = cm:model():world():faction_by_key(faction_name);\n'
++            b'\t\tlocal vassal_faction_name = REGIONS_LIBERATION_FACTIONS[REGION_SELECTED];\n'
++            b'\t\tlocal vassal_faction = cm:model():world():faction_by_key(vassal_faction_name);\n'
++            b'\t\tlocal spear_unit = BUFFER_STATE_SPEAR_UNITS[vassal_faction_name];\n'
++            b'\t\tlocal unit_list = "";\n'
++            b'\n'
++            b'\t\tif faction == nil then\n'
++            b'\t\t\tDebugLog("BUFFER: faction_by_key returned nil for "..tostring(faction_name));\n'
++            b'\t\tend\n'
++            b'\n'
++            b'\t\tif vassal_faction_name == nil then\n'
++            b'\t\t\tDebugLog("BUFFER: no REGIONS_LIBERATION_FACTIONS entry for "..tostring(REGION_SELECTED));\n'
++            b'\t\tend\n'
++            b'\n'
++            b'\t\tif vassal_faction == nil then\n'
++            b'\t\t\tDebugLog("BUFFER: faction_by_key returned nil for "..tostring(vassal_faction_name));\n'
++            b'\t\tend\n'
++            b'\n'
++            b'\t\tif spear_unit == nil then\n'
++            b'\t\t\tDebugLog("BUFFER: no BUFFER_STATE_SPEAR_UNITS entry for "..tostring(vassal_faction_name).."; falling back to att_rom_cohors");\n'
++            b'\t\tend\n'
++            b'\n'
++            b'\t\tif spear_unit then\n'
++            b'\t\t\tunit_list = spear_unit..","..spear_unit..","..spear_unit..","..spear_unit;\n'
++            b'\t\telse\n'
++            b"\t\t\t-- We need to give them something even if it's inaccurate, otherwise the army will not spawn.\n"
++            b'\t\t\tunit_list = "att_rom_cohors";\n'
++            b'\t\tend\n'
++            b'\n'
++            b'\t\tDebugLog("BUFFER: confirm resolved vassal="..tostring(vassal_faction_name).." spear_unit="..tostring(spear_unit).." unit_list="..tostring(unit_list));\n'
++            b'\n'
++            b'\t\tif not FactionIsAlive(vassal_faction_name) then\n'
++            b'\t\t\tDebugLog("BUFFER: dead branch for "..tostring(vassal_faction_name));\n'
++            b'\n'
++            b'\t\t\tlocal region = cm:model():world():region_manager():region_by_key(REGION_SELECTED);\n'
++            b'\n'
++            b'\t\t\tif region == nil then\n'
++            b'\t\t\t\tDebugLog("BUFFER: region_by_key returned nil for "..tostring(REGION_SELECTED));\n'
++            b'\t\t\tend\n'
++            b'\n'
++            b'\t\t\tlocal region_x = region:settlement():logical_position_x();\n'
++            b'\t\t\tlocal region_y = region:settlement():logical_position_y();\n'
++            b'\n'
++            b'\t\t\tDebugLog("BUFFER: spawn position x="..tostring(region_x).." y="..tostring(region_y));\n'
++            b'\t\t\tDebugLog("BUFFER: before cm:create_force");\n'
++            b'\n'
++            b'\t\t\tcm:create_force(\n'
++            b'\t\t\t\tvassal_faction_name,\n'
++            b'\t\t\t\tunit_list,\n'
++            b'\t\t\t\tREGION_SELECTED,\n'
++            b'\t\t\t\tregion_x,\n'
++            b'\t\t\t\tregion_y,\n'
++            b'\t\t\t\t"VassalArmy_"..REGION_SELECTED..cm:model():turn_number(),\n'
++            b'\t\t\t\ttrue,\n'
++            b'\t\t\t\tfunction(cqi) \n'
++            b'\n'
++            b'\t\t\t\tend\n'
++            b'\t\t\t);\n'
++            b'\n'
++            b'\t\t\tDebugLog("BUFFER: after cm:create_force");\n'
++            b'\t\t\tDebugLog("BUFFER: before cm:force_make_vassal");\n'
++            b'\n'
++            b'\t\t\tcm:force_make_vassal(faction_name, vassal_faction_name);\n'
++            b'\n'
++            b'\t\t\tDebugLog("BUFFER: after cm:force_make_vassal");\n'
++            b'\t\t\tDebugLog("BUFFER: before cm:add_time_trigger region_transfer");\n'
++            b'\n'
++            b'\t\t\tcm:add_time_trigger("region_transfer", 0.1);\n'
++            b'\n'
++            b'\t\t\tDebugLog("BUFFER: after cm:add_time_trigger region_transfer");\n'
++            b'\n'
++            b'\t\t\tif FACTIONS_TO_FACTIONS_VASSALIZED  then\n'
++            b'\t\t\t\tFaction_Vassalized(faction_name, vassal_faction_name, true, false, false);\n'
++            b'\t\t\tend\n'
++            b'\t\telse\n'
++            b'\t\t\tDebugLog("BUFFER: alive branch; transferring "..tostring(REGION_SELECTED).." to "..tostring(vassal_faction_name));\n'
++            b'\n'
++            b'\t\t\tTransfer_Region_To_Faction(REGION_SELECTED, vassal_faction_name);\n'
++            b'\n'
++            b'\t\t\tDebugLog("BUFFER: after Transfer_Region_To_Faction");\n'
++            b'\t\tend\n'
++            b'\n'
++            b'\t\tBufferPanelClosed(false);\n'
++            b'\t\tbtnBuffer:SetVisible(false);\n'
++            b'\n'
++            b'\t\tDebugLog("BUFFER: confirm handler complete");'
++        )
++        timer_old = (
++            b'function OnTimeTrigger_Buffer(context)\n'
++            b'\tif context.string == "region_transfer" then\n'
++            b'\t\tTransfer_Region_To_Faction(REGION_SELECTED, REGIONS_LIBERATION_FACTIONS[REGION_SELECTED]);\n'
++            b'\tend\n'
++            b'end'
++        )
++        timer_new = (
++            b'function OnTimeTrigger_Buffer(context)\n'
++            b'\tDebugLog("BUFFER: time trigger fired; context.string="..tostring(context.string));\n'
++            b'\n'
++            b'\tif context.string == "region_transfer" then\n'
++            b'\t\tDebugLog("BUFFER: region_transfer resolved region="..tostring(REGION_SELECTED).." faction="..tostring(REGIONS_LIBERATION_FACTIONS[REGION_SELECTED]));\n'
++            b'\n'
++            b'\t\tif REGIONS_LIBERATION_FACTIONS[REGION_SELECTED] == nil then\n'
++            b'\t\t\tDebugLog("BUFFER: no REGIONS_LIBERATION_FACTIONS entry for "..tostring(REGION_SELECTED));\n'
++            b'\t\tend\n'
++            b'\n'
++            b'\t\tDebugLog("BUFFER: before Transfer_Region_To_Faction");\n'
++            b'\n'
++            b'\t\tTransfer_Region_To_Faction(REGION_SELECTED, REGIONS_LIBERATION_FACTIONS[REGION_SELECTED]);\n'
++            b'\n'
++            b'\t\tDebugLog("BUFFER: after Transfer_Region_To_Faction");\n'
++            b'\telse\n'
++            b'\t\tDebugLog("BUFFER: time trigger ignored; not region_transfer");\n'
++            b'\tend\n'
++            b'\n'
++            b'\tDebugLog("BUFFER: time trigger handler complete");\n'
++            b'end'
++        )
++        if data.count(selected_old) != 1 or data.count(confirm_old) != 1 or data.count(timer_old) != 1:
++            raise ToolError(
++                "unexpected MK1212 buffer-state script shape; refusing a partial Lua compatibility edit"
++            )
++        data = data.replace(selected_old, selected_new)
++        data = data.replace(confirm_old, confirm_new)
++        data = data.replace(timer_old, timer_new)
++        return data, [
++            "added BUFFER DebugLog tracing to the buffer-state selection, confirm and timer handlers"
++        ]
+ 
+-\tos.execute(command);
++    if relative_folded == "campaigns/main_attila/common/mk1212_common.lua":
++        # Temporary diagnostic: trace region handovers (CRLF source) to the mod's DebugLog.
++        transfer_old = (
++            b'function Transfer_Region_To_Faction(region_name, faction_name)\r\n'
++            b'\t-- If a region has a governor then they will die when a region is transferred, so we need to temporarily give them immortality.\r\n'
++            b'\tlocal region = cm:model():world():region_manager():region_by_key(region_name);\r\n'
++            b'\tlocal owning_faction = region:owning_faction();\r\n'
++            b'\r\n'
++            b"\t-- Transfering regions can crash if it happens on an AI faction's turn for some reason.\r\n"
++            b'\tif owning_faction:is_human() or owning_faction:name() ~= FACTION_TURN then\r\n'
++            b'\t\tif region:has_governor() then\r\n'
++            b'\t\t\tlocal governor = region:governor():command_queue_index();\r\n'
++            b'\r\n'
++            b'\t\t\tcm:set_character_immortality("character_cqi:"..governor, true);\r\n'
++            b'\t\t\tcm:transfer_region_to_faction(region_name, faction_name);\r\n'
++            b'\t\t\tcm:set_character_immortality("character_cqi:"..governor, false);\r\n'
++            b'\t\telse\r\n'
++            b'\t\t\tcm:transfer_region_to_faction(region_name, faction_name);\r\n'
++            b'\t\tend\r\n'
++            b'\telse\r\n'
++            b'\t\tREGION_TO_TRANSFER = {faction_name, region_name};\r\n'
++            b'\tend\r\n'
++            b'end'
++        )
++        transfer_new = (
++            b'function Transfer_Region_To_Faction(region_name, faction_name)\r\n'
++            b'\tDebugLog("TRANSFER: entry region="..tostring(region_name).." faction="..tostring(faction_name));\r\n'
++            b'\r\n'
++            b'\t-- If a region has a governor then they will die when a region is transferred, so we need to temporarily give them immortality.\r\n'
++            b'\tlocal region = cm:model():world():region_manager():region_by_key(region_name);\r\n'
++            b'\r\n'
++            b'\tif region == nil then\r\n'
++            b'\t\tDebugLog("TRANSFER: region_by_key returned nil for "..tostring(region_name));\r\n'
++            b'\tend\r\n'
++            b'\r\n'
++            b'\tlocal owning_faction = region:owning_faction();\r\n'
++            b'\r\n'
++            b'\tif owning_faction == nil then\r\n'
++            b'\t\tDebugLog("TRANSFER: owning_faction is nil for "..tostring(region_name));\r\n'
++            b'\tend\r\n'
++            b'\r\n'
++            b'\tDebugLog("TRANSFER: owner="..tostring(owning_faction:name()).." is_human="..tostring(owning_faction:is_human()).." FACTION_TURN="..tostring(FACTION_TURN));\r\n'
++            b'\r\n'
++            b"\t-- Transfering regions can crash if it happens on an AI faction's turn for some reason.\r\n"
++            b'\tif owning_faction:is_human() or owning_faction:name() ~= FACTION_TURN then\r\n'
++            b'\t\tDebugLog("TRANSFER: immediate branch; has_governor="..tostring(region:has_governor()));\r\n'
++            b'\r\n'
++            b'\t\tif region:has_governor() then\r\n'
++            b'\t\t\tlocal governor = region:governor():command_queue_index();\r\n'
++            b'\r\n'
++            b'\t\t\tDebugLog("TRANSFER: governor cqi="..tostring(governor).."; before set_character_immortality true");\r\n'
++            b'\r\n'
++            b'\t\t\tcm:set_character_immortality("character_cqi:"..governor, true);\r\n'
++            b'\r\n'
++            b'\t\t\tDebugLog("TRANSFER: after set_character_immortality true; before cm:transfer_region_to_faction");\r\n'
++            b'\r\n'
++            b'\t\t\tcm:transfer_region_to_faction(region_name, faction_name);\r\n'
++            b'\r\n'
++            b'\t\t\tDebugLog("TRANSFER: after cm:transfer_region_to_faction; before set_character_immortality false");\r\n'
++            b'\r\n'
++            b'\t\t\tcm:set_character_immortality("character_cqi:"..governor, false);\r\n'
++            b'\r\n'
++            b'\t\t\tDebugLog("TRANSFER: after set_character_immortality false");\r\n'
++            b'\t\telse\r\n'
++            b'\t\t\tDebugLog("TRANSFER: no governor; before cm:transfer_region_to_faction");\r\n'
++            b'\r\n'
++            b'\t\t\tcm:transfer_region_to_faction(region_name, faction_name);\r\n'
++            b'\r\n'
++            b'\t\t\tDebugLog("TRANSFER: after cm:transfer_region_to_faction");\r\n'
++            b'\t\tend\r\n'
++            b'\telse\r\n'
++            b'\t\tDebugLog("TRANSFER: deferred branch; REGION_TO_TRANSFER set to "..tostring(region_name).." -> "..tostring(faction_name).."; no transfer this tick");\r\n'
++            b'\r\n'
++            b'\t\tREGION_TO_TRANSFER = {faction_name, region_name};\r\n'
++            b'\tend\r\n'
++            b'\r\n'
++            b'\tif region ~= nil then\r\n'
++            b'\t\tDebugLog("TRANSFER: exit region="..tostring(region_name).." owner now "..tostring(region:owning_faction():name()));\r\n'
++            b'\telse\r\n'
++            b'\t\tDebugLog("TRANSFER: exit region="..tostring(region_name).."; region was nil");\r\n'
++            b'\tend\r\n'
++            b'end'
++        )
++        if data.count(transfer_old) != 1:
++            raise ToolError(
++                "unexpected MK1212 region-transfer script shape; refusing a partial Lua compatibility edit"
++            )
++        data = data.replace(transfer_old, transfer_new)
++        return data, [
++            "added TRANSFER DebugLog tracing to Transfer_Region_To_Faction"
++        ]
+ 
+-\tsvr:SaveBool("SBOOL_Prompt_Already_Shown", true);
+-\tsvr:SaveBool("SBOOL_Hardcoded_Limits_Modified", true);
+-end
+-'''
+-        function_new = b'''function ModifyHardcodedLimits()
+-\t-- The bundled helper is Windows-only. Never extract or execute it on macOS.
+-\tDISCLAIMER_ACCEPTED = true;
+-\tsvr:SaveBool("SBOOL_Prompt_Already_Shown", true);
+-\tsvr:SaveBool("SBOOL_Hardcoded_Limits_Modified", true);
+-end
+-'''
+-        if data.count(function_old) != 1:
++    if relative_folded == "lua_scripts/frontend_disclaimer.lua":
++        # The frontend copy of the dropper runs unprompted once the disclaimer is accepted.
++        dropper_old = (
++            b'function ModifyHardcodedLimits()\r\n'
++            b'\tif not util.fileExists("MK1212_10slots.exe") then\r\n'
++            b'\t\trequire("lua_scripts/slots_binaries");\r\n'
++            b'\r\n'
++            b'\t\tlocal slotsFile = io.open("MK1212_10slots.exe", "wb");\r\n'
++            b'\t\tlocal binary = "";\r\n'
++            b'\t\t\t\r\n'
++            b'\t\tfor i = 1, #slots_binaries do\r\n'
++            b'\t\t\tlocal number = tonumber("0x"..slots_binaries[i]);\r\n'
++            b'\t\t\tlocal char = string.char(number);\r\n'
++            b'\r\n'
++            b'\t\t\tbinary = binary..char;\r\n'
++            b'\t\tend\r\n'
++            b'\r\n'
++            b'\t\tslotsFile:write(binary);\r\n'
++            b'\t\tslotsFile:close();\r\n'
++            b'\tend\r\n'
++            b'\r\n'
++            b'\tsvr:SaveBool("SBOOL_Prompt_Already_Shown", true);\r\n'
++            b'\tsvr:SaveBool("SBOOL_Hardcoded_Limits_Modified", true);\r\n'
++            b'\r\n'
++            b'\tlocal command = "MK1212_10slots.exe";\r\n'
++            b'\r\n'
++            b'\tos.execute(command);\r\n'
++            b'end'
++        )
++        dropper_new = (
++            b'function ModifyHardcodedLimits()\r\n'
++            b'\t-- The bundled helper is Windows-only. Never extract or execute it on macOS.\r\n'
++            b'\tsvr:SaveBool("SBOOL_Prompt_Already_Shown", true);\r\n'
++            b'\tsvr:SaveBool("SBOOL_Hardcoded_Limits_Modified", true);\r\n'
++            b'end'
++        )
++        if data.count(dropper_old) != 1:
+             raise ToolError(
+-                "unexpected MK1212 slot script shape; refusing a partial Lua compatibility edit"
++                "unexpected MK1212 frontend disclaimer shape; refusing a partial Lua compatibility edit"
+             )
+-        data = data.replace(function_old, function_new)
++        data = data.replace(dropper_old, dropper_new)
+         return data, [
+             "replaced the Windows-only ten-slot executable call with a safe macOS no-op"
+         ]
+@@ -1251,6 +1772,9 @@ def build_profile_cache(state_dir: Path, game_root: Path, records: list[dict],
+             with source.open("rb") as stream:
+                 data = read_entry(stream, entry)
+             data, lua_repairs = apply_lua_compatibility(entry.relative_path, data)
++            if lua_repairs:
++                # Every file we modified must still load in the game.
++                validate_lua_syntax(entry.relative_path, data)
+             for reason in lua_repairs:
+                 profile["lua_repairs"].append({"source_pack": str(source),
+                                                "path": entry.relative_path,
+@@ -1815,6 +2339,36 @@ def native_patch_command(args: argparse.Namespace) -> None:
+     print("The original Steam/Feral app remains unchanged and is still used for vanilla launches.")
+ 
+ 
++def check_ten_slot_patch_report(patch_result: str, expected_status: str, patch_log: Path) -> None:
++    # The load-time library reports from its constructor.  Any failure status
++    # is fatal, and so is "armed": only the retired deferred library logs it.
++    # Only the inject-only diagnostic build may report inject-only; every other
++    # library must report patched-6-to-10.
++    reported_failures = [status for status in TEN_SLOT_PATCH_FAILURES
++                         if f"status={status} " in patch_result]
++    if reported_failures:
++        raise ToolError(
++            "ATTILA exited, but the ten-slot runtime patch reported "
++            + ", ".join(reported_failures)
++            + f"; inspect {patch_log}"
++        )
++    if "status=armed " in patch_result:
++        raise ToolError(
++            "ATTILA exited, but the patch log shows the deferred (armed) library, not the "
++            f"load-time build; inspect {patch_log}"
++        )
++    if expected_status != "inject-only" and "status=inject-only " in patch_result:
++        raise ToolError(
++            "ATTILA exited, but the patch log shows inject-only from a library that is not "
++            f"the inject-only diagnostic build; inspect {patch_log}"
++        )
++    if f"status={expected_status} kern_return=0" not in patch_result:
++        raise ToolError(
++            f"ATTILA exited, but the ten-slot runtime patch did not report {expected_status}; "
++            f"inspect {patch_log}"
++        )
++
++
+ def launch_command(args: argparse.Namespace) -> None:
+     if game_running():
+         raise ToolError("ATTILA is already running; launch is refused")
+@@ -1851,17 +2405,47 @@ def launch_command(args: argparse.Namespace) -> None:
+     executable = original_executable
+     if not executable.is_file():
+         raise ToolError(f"selected ATTILA executable is missing: {executable}")
++    executable_sha256 = sha256_path(executable)
++    if executable_sha256 != SUPPORTED_RUNTIME_EXECUTABLE_SHA256:
++        raise ToolError(
++            "the ten-slot runtime patch supports only Feral ATTILA 1.6.1 build 480285.103778; "
++            f"found executable SHA-256 {executable_sha256}"
++        )
++    runtime_library = Path(__file__).resolve().with_name("libmk1212-slot-runtime-patch.dylib")
++    if not runtime_library.is_file():
++        # Source-tree commands use the reproducible build output; packaged apps
++        # carry the same signed library beside this Python module.
++        development_library = Path(__file__).resolve().parents[1] / "build/libmk1212-slot-runtime-patch.dylib"
++        if development_library.is_file():
++            runtime_library = development_library
++    if not runtime_library.is_file():
++        raise ToolError(f"ten-slot runtime patch library is missing: {runtime_library}")
++    signature = subprocess.run(
++        ["/usr/bin/codesign", "--verify", "--strict", str(runtime_library)],
++        capture_output=True, text=True,
++    )
++    if signature.returncode != 0:
++        raise ToolError("ten-slot runtime patch library signature is invalid: " + signature.stderr.strip())
++    runtime_library_sha256 = sha256_path(runtime_library)
++    expected_patch_status = ("inject-only" if runtime_library_sha256 == INJECT_ONLY_RUNTIME_PATCH_SHA256
++                             else "patched-6-to-10")
+     home = prepare_isolated_home(state_dir)
+     activation = activate_profile(state_dir, state, profile)
+     log_dir = state_dir / "logs"
+     log_dir.mkdir(parents=True, exist_ok=True)
+-    log = log_dir / f"launch-{datetime.now().strftime('%Y%m%dT%H%M%S')}.json"
++    launch_stamp = datetime.now().strftime('%Y%m%dT%H%M%S')
++    log = log_dir / f"launch-{launch_stamp}.json"
++    patch_log = log_dir / f"ten-slot-runtime-patch-{launch_stamp}.log"
+     payload = {"tool_version": TOOL_VERSION, "launched_at": utc_now(), "executable": str(executable),
+-               "executable_sha256": sha256_path(executable), "cwd": str(game_root / "TotalWarAttilaData"),
++               "executable_sha256": executable_sha256, "cwd": str(game_root / "TotalWarAttilaData"),
+                "original_executable": str(original_executable),
+                "original_executable_sha256": sha256_path(original_executable),
+                "native_slot_clone": native, "argv": [str(executable)], "isolated_home": str(home),
+                "feral_app_unchanged": True,
++               "ten_slot_runtime_patch_library": str(runtime_library),
++               "ten_slot_runtime_patch_library_sha256": runtime_library_sha256,
++               "ten_slot_runtime_patch_expected_status": expected_patch_status,
++               "ten_slot_runtime_patch_log": str(patch_log),
+                "profile_key": profile["key"], "pack_names": profile["pack_names"],
+                "optional_packs": picked, "dds_repairs": profile["dds_repairs"],
+                "lua_repairs": profile.get("lua_repairs", []),
+@@ -1870,6 +2454,8 @@ def launch_command(args: argparse.Namespace) -> None:
+     environment = os.environ.copy()
+     environment["CFFIXED_USER_HOME"] = str(home)
+     environment["MK1212_MAC_SLOT_LOG"] = str(log_dir / "slot-diagnostic.log")
++    environment["MK1212_MAC_SLOT_PATCH_LOG"] = str(patch_log)
++    environment["DYLD_INSERT_LIBRARIES"] = str(runtime_library)
+     environment.setdefault("SteamAppId", APP_ID)
+     environment.setdefault("SteamGameId", APP_ID)
+     child = None
+@@ -1889,7 +2475,13 @@ def launch_command(args: argparse.Namespace) -> None:
+             child.wait()
+         deactivate_profile(state_dir, state, activation)
+     if return_code != 0:
+-        raise ToolError(f"ATTILA exited with status {return_code}; transient compatibility files were removed")
++        patch_result = patch_log.read_text(errors="replace").strip() if patch_log.is_file() else "no patch log"
++        raise ToolError(
++            f"ATTILA exited with status {return_code}; transient compatibility files were removed. "
++            f"Ten-slot patch report: {patch_result}"
++        )
++    patch_result = patch_log.read_text(errors="replace").strip() if patch_log.is_file() else ""
++    check_ten_slot_patch_report(patch_result, expected_patch_status, patch_log)
+ 
+ 
+ def make_parser() -> argparse.ArgumentParser:
+diff --git a/src/mk1212_slot_runtime_patch.c b/src/mk1212_slot_runtime_patch.c
+new file mode 100644
+index 0000000..0897f30
+--- /dev/null
++++ b/src/mk1212_slot_runtime_patch.c
+@@ -0,0 +1,146 @@
++#include <fcntl.h>
++#include <mach-o/dyld.h>
++#include <mach-o/loader.h>
++#include <mach/mach.h>
++#include <mach/mach_vm.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++/* Feral ATTILA 1.6.1, build 480285.103778, arm64. */
++static const uint8_t supported_uuid[16] = {
++    0x39, 0x2d, 0x6f, 0x66, 0x91, 0x83, 0x32, 0x9e,
++    0x8a, 0x98, 0x8c, 0x90, 0xfc, 0x82, 0x83, 0x26,
++};
++
++/* Store settlement-capital flag; mov w8, #6; store maximum slot count. */
++static const uint8_t before_context[12] = {
++    0x08, 0xc0, 0x01, 0x39,
++    0xc8, 0x00, 0x80, 0x52,
++    0x08, 0x74, 0x00, 0xb9,
++};
++
++static const uint8_t replacement_instruction[4] = {
++    0x48, 0x01, 0x80, 0x52, /* mov w8, #10 */
++};
++
++/* A/B test: patch the first site only.  0x034577f4 is deliberately left
++   alone -- it is neither read, guarded, nor written. */
++#define PATCH_SITE_COUNT 1
++
++static const uintptr_t patch_offsets[PATCH_SITE_COUNT] = {
++    0x03457244,
++};
++
++static int image_uuid(const struct mach_header_64 *header, uint8_t result[16]) {
++    const uint8_t *cursor = (const uint8_t *)(header + 1);
++    for (uint32_t index = 0; index < header->ncmds; ++index) {
++        const struct load_command *command = (const struct load_command *)cursor;
++        if (command->cmdsize < sizeof(*command)) {
++            return 0;
++        }
++        if (command->cmd == LC_UUID && command->cmdsize >= sizeof(struct uuid_command)) {
++            const struct uuid_command *uuid = (const struct uuid_command *)command;
++            memcpy(result, uuid->uuid, 16);
++            return 1;
++        }
++        cursor += command->cmdsize;
++    }
++    return 0;
++}
++
++static const struct mach_header_64 *main_executable(void) {
++    uint32_t count = _dyld_image_count();
++    for (uint32_t index = 0; index < count; ++index) {
++        const struct mach_header *candidate = _dyld_get_image_header(index);
++        if (candidate != NULL && candidate->magic == MH_MAGIC_64 &&
++                candidate->filetype == MH_EXECUTE) {
++            return (const struct mach_header_64 *)candidate;
++        }
++    }
++    return NULL;
++}
++
++static void log_result(int descriptor, const char *status, kern_return_t code) {
++    if (descriptor >= 0) {
++        dprintf(descriptor, "runtime_patch status=%s kern_return=%d\n", status, code);
++    }
++}
++
++__attribute__((constructor))
++static void mk1212_runtime_patch(void) {
++    const char *log_path = getenv("MK1212_MAC_SLOT_PATCH_LOG");
++    int descriptor = -1;
++    if (log_path != NULL && log_path[0] != '\0') {
++        descriptor = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
++    }
++
++    const struct mach_header_64 *header = main_executable();
++    if (header == NULL) {
++        log_result(descriptor, "no-main-executable", KERN_INVALID_ADDRESS);
++        if (descriptor >= 0) close(descriptor);
++        return;
++    }
++
++    uint8_t uuid[16] = {0};
++    if (!image_uuid(header, uuid) || memcmp(uuid, supported_uuid, sizeof(uuid)) != 0) {
++        log_result(descriptor, "unsupported-uuid", KERN_INVALID_ARGUMENT);
++        if (descriptor >= 0) close(descriptor);
++        return;
++    }
++
++    uint8_t *sites[PATCH_SITE_COUNT];
++    for (size_t index = 0; index < PATCH_SITE_COUNT; ++index) {
++        sites[index] = (uint8_t *)header + patch_offsets[index];
++        if (memcmp(sites[index] - 4, before_context, sizeof(before_context)) != 0) {
++            log_result(descriptor, "preimage-mismatch", KERN_INVALID_ARGUMENT);
++            if (descriptor >= 0) close(descriptor);
++            return;
++        }
++    }
++
++    vm_size_t page_size = (vm_size_t)getpagesize();
++    mach_vm_address_t first_page = (mach_vm_address_t)sites[0] & ~((mach_vm_address_t)page_size - 1);
++    mach_vm_address_t last_page =
++        (mach_vm_address_t)(sites[PATCH_SITE_COUNT - 1] + sizeof(replacement_instruction) - 1) &
++        ~((mach_vm_address_t)page_size - 1);
++    mach_vm_size_t span = (last_page - first_page) + page_size;
++
++    kern_return_t result = mach_vm_protect(
++        mach_task_self(), first_page, span, FALSE,
++        VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY
++    );
++    if (result != KERN_SUCCESS) {
++        log_result(descriptor, "make-writable-failed", result);
++        if (descriptor >= 0) close(descriptor);
++        return;
++    }
++
++    for (size_t index = 0; index < PATCH_SITE_COUNT; ++index) {
++        memcpy(sites[index], replacement_instruction, sizeof(replacement_instruction));
++    }
++    __builtin___clear_cache((char *)first_page, (char *)(first_page + span));
++
++    result = mach_vm_protect(
++        mach_task_self(), first_page, span, FALSE,
++        VM_PROT_READ | VM_PROT_EXECUTE
++    );
++    if (result != KERN_SUCCESS) {
++        log_result(descriptor, "restore-execute-failed", result);
++        if (descriptor >= 0) close(descriptor);
++        return;
++    }
++
++    for (size_t index = 0; index < PATCH_SITE_COUNT; ++index) {
++        if (memcmp(sites[index], replacement_instruction, sizeof(replacement_instruction)) != 0) {
++            log_result(descriptor, "postimage-mismatch", KERN_FAILURE);
++            if (descriptor >= 0) close(descriptor);
++            return;
++        }
++    }
++
++    log_result(descriptor, "patched-6-to-10", KERN_SUCCESS);
++    if (descriptor >= 0) close(descriptor);
++}
+diff --git a/src/mk1212_slot_runtime_patch_inject_only.c b/src/mk1212_slot_runtime_patch_inject_only.c
+new file mode 100644
+index 0000000..a51903e
+--- /dev/null
++++ b/src/mk1212_slot_runtime_patch_inject_only.c
+@@ -0,0 +1,102 @@
++#include <fcntl.h>
++#include <mach-o/dyld.h>
++#include <mach-o/loader.h>
++#include <mach/mach.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++/* Feral ATTILA 1.6.1, build 480285.103778, arm64. */
++static const uint8_t supported_uuid[16] = {
++    0x39, 0x2d, 0x6f, 0x66, 0x91, 0x83, 0x32, 0x9e,
++    0x8a, 0x98, 0x8c, 0x90, 0xfc, 0x82, 0x83, 0x26,
++};
++
++/* Store settlement-capital flag; mov w8, #6; store maximum slot count. */
++static const uint8_t before_context[12] = {
++    0x08, 0xc0, 0x01, 0x39,
++    0xc8, 0x00, 0x80, 0x52,
++    0x08, 0x74, 0x00, 0xb9,
++};
++
++/* Diagnostic build: injected and guarded exactly like the site-1 patch, but
++   it never changes memory protection and never writes to the executable.
++   A clean run logs inject-only. */
++#define PATCH_SITE_COUNT 1
++
++static const uintptr_t patch_offsets[PATCH_SITE_COUNT] = {
++    0x03457244,
++};
++
++static int image_uuid(const struct mach_header_64 *header, uint8_t result[16]) {
++    const uint8_t *cursor = (const uint8_t *)(header + 1);
++    for (uint32_t index = 0; index < header->ncmds; ++index) {
++        const struct load_command *command = (const struct load_command *)cursor;
++        if (command->cmdsize < sizeof(*command)) {
++            return 0;
++        }
++        if (command->cmd == LC_UUID && command->cmdsize >= sizeof(struct uuid_command)) {
++            const struct uuid_command *uuid = (const struct uuid_command *)command;
++            memcpy(result, uuid->uuid, 16);
++            return 1;
++        }
++        cursor += command->cmdsize;
++    }
++    return 0;
++}
++
++static const struct mach_header_64 *main_executable(void) {
++    uint32_t count = _dyld_image_count();
++    for (uint32_t index = 0; index < count; ++index) {
++        const struct mach_header *candidate = _dyld_get_image_header(index);
++        if (candidate != NULL && candidate->magic == MH_MAGIC_64 &&
++                candidate->filetype == MH_EXECUTE) {
++            return (const struct mach_header_64 *)candidate;
++        }
++    }
++    return NULL;
++}
++
++static void log_result(int descriptor, const char *status, kern_return_t code) {
++    if (descriptor >= 0) {
++        dprintf(descriptor, "runtime_patch status=%s kern_return=%d\n", status, code);
++    }
++}
++
++__attribute__((constructor))
++static void mk1212_runtime_patch(void) {
++    const char *log_path = getenv("MK1212_MAC_SLOT_PATCH_LOG");
++    int descriptor = -1;
++    if (log_path != NULL && log_path[0] != '\0') {
++        descriptor = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
++    }
++
++    const struct mach_header_64 *header = main_executable();
++    if (header == NULL) {
++        log_result(descriptor, "no-main-executable", KERN_INVALID_ADDRESS);
++        if (descriptor >= 0) close(descriptor);
++        return;
++    }
++
++    uint8_t uuid[16] = {0};
++    if (!image_uuid(header, uuid) || memcmp(uuid, supported_uuid, sizeof(uuid)) != 0) {
++        log_result(descriptor, "unsupported-uuid", KERN_INVALID_ARGUMENT);
++        if (descriptor >= 0) close(descriptor);
++        return;
++    }
++
++    uint8_t *sites[PATCH_SITE_COUNT];
++    for (size_t index = 0; index < PATCH_SITE_COUNT; ++index) {
++        sites[index] = (uint8_t *)header + patch_offsets[index];
++        if (memcmp(sites[index] - 4, before_context, sizeof(before_context)) != 0) {
++            log_result(descriptor, "preimage-mismatch", KERN_INVALID_ARGUMENT);
++            if (descriptor >= 0) close(descriptor);
++            return;
++        }
++    }
++
++    log_result(descriptor, "inject-only", KERN_SUCCESS);
++    if (descriptor >= 0) close(descriptor);
++}
