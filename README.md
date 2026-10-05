@@ -1,8 +1,10 @@
 # MK1212 on the Feral macOS port: investigation record
 
-A record of what it took to run the Medieval Kingdoms 1212 AD mod on Feral Interactive's macOS port of Total War: ATTILA, and of why ten building slots have no clean fix on that port.
+> **The ten-slot issue is resolved.** It was fixed in [ausxen's MK1212 macOS Launcher](https://github.com/ausxen/MK1212_macOS) 0.8.0, released 3 October 2026. That release changes the `+0x74` slot-count field on the heap, interposing `operator new` to catch the settlement-callback object as it is allocated, and leaves the signed code page untouched. The analysis in this record identified that object and that field, and pointed at writing the heap in place of the page.
 
-**This is not a launcher.** The launcher is [ausxen's MK1212 macOS Launcher](https://github.com/ausxen/MK1212_macOS) — start there if you want to play the mod. This repository holds findings, a patch of local changes against that launcher, and the static analysis behind them.
+A record of what it took to run the Medieval Kingdoms 1212 AD mod on Feral Interactive's macOS port of Total War: ATTILA, and of how the ten-building-slot fault was tracked down.
+
+**This is not a launcher.** The launcher is [ausxen's MK1212 macOS Launcher](https://github.com/ausxen/MK1212_macOS). Start there if you want to play the mod. This repository holds findings, a patch of local changes against that launcher, and the static analysis behind them.
 
 This is independent work. It is not affiliated with, endorsed by, or supported by Feral Interactive, SEGA, Creative Assembly, or the MK1212 team.
 
@@ -20,7 +22,7 @@ Status as of 28 September 2026. This record covers the work from 13 to 28 Septem
 ## Summary
 
 - **MK1212 runs.** All 13 packs load through ausxen's launcher with local fixes, and the campaign scripts run: the Holy Roman Empire, population, papal favour, crusades, decisions, and the rest of the mechanics registry.
-- **Ten-slot settlements work but degrade input, and the cause is now known.** A runtime patch gives ten building slots. After roughly 5 to 10 minutes of play, clicks stop taking effect, and later the camera zooms on its own. The trigger is modifying one of the game's signed code pages in memory, not the slot value or ten slots as such: a control library that loads into the game and rewrites a page but only at instructions that never execute reproduces the degradation, while an otherwise identical library that writes nothing runs clean for 27 minutes. Both routes that change the value without writing a code page were unavailable: rewriting the page is what causes the fault, and a hardware-breakpoint approach was out of scope. So the port has no accepted ten-slot fix, and six slots is the only stable configuration.
+- **Ten-slot settlements work but degrade input, and the cause is now known.** A runtime patch gives ten building slots. After roughly 5 to 10 minutes of play, clicks stop taking effect, and later the camera zooms on its own. The trigger is modifying one of the game's signed code pages in memory, not the slot value or ten slots as such: a control library that loads into the game and rewrites a page but only at instructions that never execute reproduces the degradation, while an otherwise identical library that writes nothing runs clean for 27 minutes. Of the two routes considered here for changing the value without writing a code page, neither was available: rewriting the page is what causes the fault, and a hardware-breakpoint approach was out of scope. A third route, writing the heap field at construction, was found afterwards and is what launcher 0.8.0 uses, so ten slots is now fixed. What follows records how the cause was isolated.
 - **Buffer-state release is broken for 47 regions.** The spear units for six Mediterranean factions don't exist in the game data. This is an MK1212 bug on every platform.
 - **Some papal features are absent by design.** MK1212 disables the College of Cardinals, papal missions, and the papal election panel in its own source.
 
@@ -202,13 +204,14 @@ The value stored, and ten slots as such, are therefore not the cause. Modifying 
 
 Static analysis identified the patched object as `EMPIRECAMPAIGN::CampaignSettlementCallback`, a polymorphic class. Its `+0x74` field is the number of `building_slot_N` widgets the capital's settlement panel fills in and refreshes. The constructor defaults it to 4; site 1 raises it to 6 for provincial capitals, matching vanilla ATTILA's 4-slot minor settlements and 6-slot capitals. The field is read only as a loop bound over interface widgets. It never sizes memory, indexes an array, or reaches an allocator, which is consistent with the patch never appearing near any crash and with the degradation having no memory cost.
 
-### Routes to a fix, and why they're closed
+### Routes to a fix
 
-- **Rewrite the code page** (the current patch): works, but is the cause of the degradation.
+- **Write the heap field** (what launcher 0.8.0 does): catch the settlement-callback object as it is allocated, then change `+0x74` from 6 to 10 in the object itself. The code page is never written. 0.8.0 interposes `operator new`, recognises the allocation by its 160-byte size and the return address inside the constructor, confirms identity against both vtable pointers, and compare-exchanges the field. ausxen found this route after the investigation, building on the class identification in [What `+0x74` actually controls](#what-0x74-actually-controls). It is the accepted fix.
+- **Rewrite the code page** (the patch in this repository): works, and is the cause of the degradation.
 - **Hardware breakpoint:** set an execution breakpoint at site 1 and change the register value on each hit, writing no game memory. This needs a library that drives the game's own threads through the debug registers and an exception port, which is a debugger in all but name and was ruled out of scope.
 - **Rewrite the executable file:** rejected by code signing, established by four controlled runs (see [Attempt 1](#attempt-1-patching-the-executable-file)).
 
-No route changes the slot count without either modifying a code page or attaching a debugger, so the port has no accepted ten-slot fix.
+This investigation closed the last three: the code-page write degrades input, the breakpoint route was out of scope, and the file rewrite is refused by code signing. The heap route is the one it left unexplored, and it is the one that worked.
 
 ### Why the interface couldn't be measured directly
 
@@ -243,10 +246,12 @@ An earlier theory was that something in the interface accumulates while the valu
 
 ## Open questions and next steps
 
-The ten-slot cause is now understood (see [What's established](#whats-established)), and the two routes that might change the value without writing a code page are both closed on this setup: the hardware-breakpoint approach is out of scope, and rewriting the file is rejected by code signing. What remains is a question for someone with more macOS code-signing knowledge, and the reports.
+The ten-slot cause was understood here (see [What's established](#whats-established)), and the fix followed from it: launcher 0.8.0 changes the heap field and leaves the code page alone, which closes this out. The findings were reported to ausxen, who credits the audit in the 0.8.0 release notes.
 
-1. **The code-signing question for the author.** Is there an entitlement or signing arrangement under which an injected library can modify a signed code page without moving the process into the state that degrades input? If not, ten slots has no clean fix on this port, and six slots stands as the stable configuration.
-2. **Report the findings** to the launcher's author and the MK1212 team.
+What remains open:
+
+1. **The code-signing question, still unanswered.** Is there an entitlement or signing arrangement under which an injected library can modify a signed code page without moving the process into the state that degrades input? 0.8.0 sidesteps the question rather than answering it, so the underlying mechanism remains unexplained. It matters for any future patch that has no heap-side equivalent.
+2. **Report the buffer-state findings** to the MK1212 team. Those are unfixed and affect every platform.
 
 ## Findings to report
 
@@ -258,7 +263,7 @@ The ten-slot cause is now understood (see [What's established](#whats-establishe
 - Version 0.6.1 left the second executable dropper in `frontend_disclaimer.lua` unpatched. Version 0.7.0 replaces that file.
 - Version 0.6.1's `bin/` scripts point at a path that doesn't exist.
 - The on-disk patch fails purely on signature, established by four controlled runs.
-- **Version 0.7.0's input degradation is caused by the in-memory code-page write itself rather than by ten slots.** An inject-only control that runs every guard but writes nothing played clean for 27 minutes, while a write to dead code (site 2, confirmed unreferenced) degraded input the same way the real patch does. The `+0x74` value is only a widget-loop bound and never sizes memory. The likely reading is that rewriting a signed code page moves the process into a state macOS handles differently; the exact mechanism is open. If there's a code-signing or entitlement angle that lets the page be modified cleanly, that would be the fix; otherwise the remaining route is a hardware breakpoint that writes no game memory.
+- **Version 0.7.0's input degradation is caused by the in-memory code-page write itself rather than by ten slots.** An inject-only control that runs every guard but writes nothing played clean for 27 minutes, while a write to dead code (site 2, confirmed unreferenced) degraded input the same way the real patch does. The `+0x74` value is only a widget-loop bound and never sizes memory. The likely reading is that rewriting a signed code page moves the process into a state macOS handles differently; the exact mechanism is open. The fix is to change the value without touching the page, by catching the callback object at construction and writing `+0x74` on the heap. **Reported, and fixed in 0.8.0 along these lines.**
 
 ### To the MK1212 team
 
@@ -293,7 +298,7 @@ The Mac has 8 GB of memory, and a long session reaches a footprint of about 4.2 
 | Patched object | `EMPIRECAMPAIGN::CampaignSettlementCallback`; `+0x74` is the capital's building-slot widget count, default 4, raised to 6 for capitals |
 | Bytes before the patch | `08 c0 01 39  c8 00 80 52  08 74 00 b9` |
 | Patched instruction | `48 01 80 52` (`mov w8,#10`) |
-| Patch library in use | Load-time, site 1 only, SHA-256 `368739c2…` |
+| Patch library used here | Load-time, site 1 only, SHA-256 `368739c2…` |
 | Original manifest | SHA-256 `c65f9103…`, backed up at `~/mk1212-manifest-original.txt` |
 | Crash on startup, on-disk patch | `+0x682a8` |
 | Crashes from interface walking | `+0x214f348`, `+0x1b9c864` |
